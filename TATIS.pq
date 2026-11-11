@@ -1,12 +1,11 @@
 // QUERY: TATIS_Fact
-// Revision 4: renames the generated field to Indicator and excludes unusable non-numeric records
-// Purpose: Load the three Transport and Travel in Scotland 2025 workbooks from SharePoint,
+// Revision 5: loads the three workbooks from a local Windows folder
+// Purpose: Load the three Transport and Travel in Scotland 2025 workbooks from a local folder,
 //          extract every named Excel table, and reshape them to a common long format.
-// Assumption: the files remain in Harvey Blundell's OneDrive/SharePoint site and retain their current names.
+// Assumption: the files remain in the configured local folder and retain their current names.
 let
     // ===== Parameters =====
-    pSiteUrl = "https://scotsconnect-my.sharepoint.com/personal/harvey_blundell_transport_gov_scot",
-    pFolderContains = null,   // Optional text filter, e.g. "Documents/TATIS"; leave null to search the site
+    pFolderPath = "C:\Users\hblunde-dtds01\Documents\Travel Survey",
 
     TargetFiles = {
         [Dataset = "Local authority", FileName = "transport-and-travel-in-scotland-2025-local-authority-tables.xlsx"],
@@ -100,13 +99,12 @@ let
         in
             Reorder,
 
-    // ===== SharePoint ingestion =====
-    SiteFiles = SharePoint.Files(pSiteUrl, [ApiVersion = 15]),
-    FolderFiltered = if pFolderContains = null or Text.Trim(Text.From(pFolderContains)) = ""
-        then SiteFiles
-        else Table.SelectRows(SiteFiles, each Text.Contains([Folder Path], Text.From(pFolderContains), Comparer.OrdinalIgnoreCase)),
+    // ===== Local folder ingestion =====
+    FolderFiles = Folder.Files(pFolderPath),
     TargetNames = List.Transform(TargetFiles, each [FileName]),
-    SelectedFiles = Table.SelectRows(FolderFiltered, each List.Contains(TargetNames, [Name])),
+    SelectedFiles = Table.SelectRows(FolderFiles, each
+        List.Contains(TargetNames, [Name])
+        and Text.TrimEnd([Folder Path], "\") = Text.TrimEnd(pFolderPath, "\")),
     AddDataset = Table.AddColumn(SelectedFiles, "Dataset", each
         let f = [Name]
         in Record.Field(List.First(List.Select(TargetFiles, each [FileName] = f)), "Dataset"), type text),
