@@ -1,0 +1,138 @@
+// QUERY: TATIS_Fact
+// Revision 4: renames the generated field to Indicator and excludes unusable non-numeric records
+// Purpose: Load the three Transport and Travel in Scotland 2025 workbooks from SharePoint,
+//          extract every named Excel table, and reshape them to a common long format.
+// Assumption: the files remain in Harvey Blundell's OneDrive/SharePoint site and retain their current names.
+let
+    // ===== Parameters =====
+    pSiteUrl = "https://scotsconnect-my.sharepoint.com/personal/harvey_blundell_transport_gov_scot",
+    pFolderContains = null,   // Optional text filter, e.g. "Documents/TATIS"; leave null to search the site
+
+    TargetFiles = {
+        [Dataset = "Local authority", FileName = "transport-and-travel-in-scotland-2025-local-authority-tables.xlsx"],
+        [Dataset = "Social survey", FileName = "transport-and-travel-in-scotland-2025-social-survey-tables.xlsx"],
+        [Dataset = "Travel diary", FileName = "transport-and-travel-in-scotland-2025-travel-diary-tables.xlsx"]
+    },
+
+    // Fields that normally identify an observation rather than hold an estimate.
+    IdentifierTerms = {
+        "year", "years", "measure", "category", "characteristic", "population", "group",
+        "geographical category", "geography", "sub-geography", "area", "council", "region",
+        "rtp", "mode", "purpose", "distance", "duration", "day", "time", "sex", "age",
+        "disability", "employment", "household", "sample size", "base", "estimate",
+        "table number", "table name", "topic", "comments", "note", "notes"
+    },
+
+    // ===== Helper functions =====
+    fnCleanName = (name as text) as text =>
+        Text.Trim(Text.Clean(Text.Replace(Text.Replace(name, "#(lf)", " "), "#(cr)", " "))),
+
+    fnIsIdentifier = (name as text) as logical =>
+        let
+            n = Text.Lower(fnCleanName(name)),
+            exactOrContained = List.AnyTrue(List.Transform(IdentifierTerms, each n = _ or Text.Contains(n, _)))
+        in
+            exactOrContained,
+
+    fnYearFromText = (value as any) as nullable number =>
+        let
+            t = try Text.From(value) otherwise null,
+            candidates = if t = null then {} else List.Transform({1999..2026}, each Text.From(_)),
+            hits = if t = null then {} else List.Select(candidates, each Text.Contains(t, _)),
+            result = if List.Count(hits) = 1 then Number.FromText(hits{0}) else null
+        in
+            result,
+
+    fnNormaliseValue = (value as any) as record =>
+        let
+            txt = if value = null then null else Text.Trim(Text.From(value)),
+            lower = if txt = null then null else Text.Lower(txt),
+            suppressed = lower <> null and (
+                Text.Contains(lower, "small sample") or lower = ".." or lower = ":" or lower = "-"
+            ),
+            cleaned = if txt = null or suppressed then null else Text.Replace(Text.Replace(txt, "%", ""), ",", ""),
+            numeric = try Number.From(cleaned, "en-GB") otherwise null
+        in
+            [Estimate = numeric, RawValue = txt, SuppressionStatus = if suppressed then "Suppressed" else if numeric = null and txt <> null and txt <> "" then "Non-numeric" else "Published"],
+
+    fnTransformTable = (input as table, dataset as text, fileName as text, itemName as text) as table =>
+        let
+            CleanColumnNames = Table.TransformColumnNames(input, fnCleanName),
+            RemoveBlankRows = Table.SelectRows(CleanColumnNames, each List.NonNullCount(Record.FieldValues(_)) > 0),
+            Columns = Table.ColumnNames(RemoveBlankRows),
+            IdentifierColumns = List.Select(Columns, each fnIsIdentifier(_)),
+            CandidateMeasureColumns = List.Difference(Columns, IdentifierColumns),
+            // If heuristic finds no identifiers, preserve the first two columns as row identifiers.
+            EffectiveIdentifiers = if List.Count(IdentifierColumns) > 0 then IdentifierColumns else List.FirstN(Columns, List.Min({2, List.Count(Columns)})),
+            EffectiveMeasures = List.Difference(Columns, EffectiveIdentifiers),
+            // Always return the columns required by downstream steps.
+            // A table with no measure columns is skipped rather than returning a schema-less table.
+            Unpivoted = if List.Count(EffectiveMeasures) = 0
+                then #table({"Indicator", "Value"}, {})
+                else Table.Unpivot(RemoveBlankRows, EffectiveMeasures, "Indicator", "Value"),
+            AddParsed = Table.AddColumn(Unpivoted, "Parsed", each fnNormaliseValue(Record.FieldOrDefault(_, "Value", null)), type record),
+            ExpandParsed = Table.ExpandRecordColumn(AddParsed, "Parsed", {"Estimate", "RawValue", "SuppressionStatus"}, {"Estimate", "Raw value", "Suppression status"}),
+            AddDataset = Table.AddColumn(ExpandParsed, "Dataset", each dataset, type text),
+            AddFile = Table.AddColumn(AddDataset, "Source file", each fileName, type text),
+            AddItem = Table.AddColumn(AddFile, "Source table", each itemName, type text),
+            AddYear = Table.AddColumn(AddItem, "Year", each
+                let
+                    yearFields = List.Select(Record.FieldNames(_), each Text.Contains(Text.Lower(_), "year")),
+                    fromFields = List.RemoveNulls(List.Transform(yearFields, (c) => fnYearFromText(Record.Field(_, c)))),
+                    fromMeasure = fnYearFromText([Indicator])
+                in
+                    if List.Count(fromFields) > 0 then fromFields{0} else fromMeasure, Int64.Type),
+            AddUnit = Table.AddColumn(AddYear, "Unit", each
+                let m = Text.Lower([Indicator])
+                in if Text.Contains(m, "sample") or Text.Contains(m, "base") then "Count"
+                   else if Text.Contains(m, "£") or Text.Contains(m, "cost") or Text.Contains(m, "spent") then "Currency or cost measure"
+                   else "Percentage or published measure", type text),
+            AddBreak = Table.AddColumn(AddUnit, "Methodology warning", each
+                if dataset = "Travel diary" and [Year] = 2025 then "Break in series at 2025: redesigned travel diary"
+                else if [Year] = 2020 or [Year] = 2021 then "2020 and 2021 telephone survey results are not directly comparable"
+                else null, type text),
+            RemoveOriginal = Table.RemoveColumns(AddBreak, {"Value"}),
+            Reorder = Table.ReorderColumns(RemoveOriginal,
+                List.Combine({
+                    {"Dataset", "Source file", "Source table", "Year", "Indicator", "Estimate", "Raw value", "Unit", "Suppression status", "Methodology warning"},
+                    List.Difference(Table.ColumnNames(RemoveOriginal), {"Dataset", "Source file", "Source table", "Year", "Indicator", "Estimate", "Raw value", "Unit", "Suppression status", "Methodology warning"})
+                }))
+        in
+            Reorder,
+
+    // ===== SharePoint ingestion =====
+    SiteFiles = SharePoint.Files(pSiteUrl, [ApiVersion = 15]),
+    FolderFiltered = if pFolderContains = null or Text.Trim(Text.From(pFolderContains)) = ""
+        then SiteFiles
+        else Table.SelectRows(SiteFiles, each Text.Contains([Folder Path], Text.From(pFolderContains), Comparer.OrdinalIgnoreCase)),
+    TargetNames = List.Transform(TargetFiles, each [FileName]),
+    SelectedFiles = Table.SelectRows(FolderFiltered, each List.Contains(TargetNames, [Name])),
+    AddDataset = Table.AddColumn(SelectedFiles, "Dataset", each
+        let f = [Name]
+        in Record.Field(List.First(List.Select(TargetFiles, each [FileName] = f)), "Dataset"), type text),
+
+    AddWorkbook = Table.AddColumn(AddDataset, "Workbook", each Excel.Workbook([Content], null, true)),
+    ExpandWorkbook = Table.ExpandTableColumn(AddWorkbook, "Workbook", {"Name", "Data", "Item", "Kind", "Hidden"}, {"Object name", "Data", "Item", "Kind", "Hidden"}),
+
+    // Named Excel tables are materially more stable than rendered worksheets.
+    KeepTables = Table.SelectRows(ExpandWorkbook, each [Kind] = "Table" and ([Hidden] = false or [Hidden] = null)),
+    AddNormalised = Table.AddColumn(KeepTables, "Normalised", each fnTransformTable([Data], [Dataset], [Name], [Item])),
+    Combined = if Table.RowCount(AddNormalised) = 0
+        then error "No named Excel tables were found in the selected workbooks. Check the site/folder path and workbook table definitions."
+        else Table.Combine(AddNormalised[Normalised]),
+
+    // Retain analysable numeric observations and explicitly suppressed observations.
+    // This removes titles, notes and other non-numeric cells classified as Non-numeric.
+    FilterUsableRecords = Table.SelectRows(Combined, each
+        [Estimate] <> null or [Suppression status] = "Suppressed"),
+
+    // Useful technical key for tracing and relationships. It is not intended as a statistical identifier.
+    AddSourceKey = Table.AddColumn(FilterUsableRecords, "Source key", each Text.Combine({[Dataset], [Source table], [Indicator]}, "|"), type text),
+    FinalTypes = Table.TransformColumnTypes(AddSourceKey, {
+        {"Dataset", type text}, {"Source file", type text}, {"Source table", type text},
+        {"Year", Int64.Type}, {"Indicator", type text}, {"Estimate", type number},
+        {"Raw value", type text}, {"Unit", type text}, {"Suppression status", type text},
+        {"Methodology warning", type text}, {"Source key", type text}
+    }, "en-GB")
+in
+    FinalTypes
